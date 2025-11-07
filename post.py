@@ -1,62 +1,79 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import pandas as pd
+import motor.motor_asyncio
+from dotenv import load_dotenv
+import os
+from bson import ObjectId
 
-app = FastAPI(title="Post Title Search API")
+load_dotenv()
 
-# -----------------------------
-# 🔹 Post Model
-# -----------------------------
-class Post(BaseModel):
-    post_id: int
+app = FastAPI(title="Post Search API (MongoDB-Compatible)")
+
+# ---------------- MongoDB Setup ----------------
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+db = client["auth-db"]
+posts_collection = db.posts
+
+# ---------------- Models ----------------
+class PostSearchResponse(BaseModel):
+    post_id: str
     title: str
-    content: str
-    tags: str
-    author: str
+    description: str
+    category: str
+    mediaType: Optional[str]
+    mediaUrl: Optional[str]
+    similarity_score: float
 
-# -----------------------------
-# 🔹 Search Posts by Title Only
-# -----------------------------
-@app.post("/search_posts_by_title/")
-def search_posts_by_title(posts: List[Post], query: str, top_n: int = 5):
-    # Convert posts into DataFrame
-    posts_df = pd.DataFrame([p.dict() for p in posts])
+class SearchPostsRequest(BaseModel):
+    query: str
+    top_n: int = 5  # default top 5 results
 
-    # TF-IDF on post titles only
+# ---------------- Helper Function ----------------
+async def fetch_all_posts():
+    posts = await posts_collection.find({}).to_list(length=1000)
+    return posts
+
+# ---------------- API Endpoint ----------------
+@app.post("/search_posts_by_title/", response_model=List[PostSearchResponse])
+async def search_posts_by_title(request: SearchPostsRequest):
+    posts = await fetch_all_posts()
+    if not posts:
+        return []
+
+    # TF-IDF on post titles (or combine title + description if needed)
+    corpus = [p["title"] for p in posts]
     vectorizer = TfidfVectorizer(stop_words="english")
-    tfidf_matrix = vectorizer.fit_transform(posts_df["title"])
+    tfidf_matrix = vectorizer.fit_transform(corpus)
 
     # Transform query
-    query_vector = vectorizer.transform([query])
+    query_vector = vectorizer.transform([request.query])
 
     # Compute similarity
     similarity_scores = cosine_similarity(query_vector, tfidf_matrix).flatten()
 
-    # Sort and get top N results
-    top_indices = similarity_scores.argsort()[::-1][:top_n]
+    # Get top N results
+    top_indices = similarity_scores.argsort()[::-1][:request.top_n]
 
-    # Prepare response
     results = [
-        {
-            "post_id": int(posts_df.iloc[i]["post_id"]),
-            "title": posts_df.iloc[i]["title"],
-            "tags": posts_df.iloc[i]["tags"],
-            "author": posts_df.iloc[i]["author"],
-            "similarity_score": round(float(similarity_scores[i]), 3)
-        }
+        PostSearchResponse(
+            post_id=str(posts[i]["_id"]),
+            title=posts[i]["title"],
+            description=posts[i]["description"],
+            category=posts[i]["category"],
+            mediaType=posts[i].get("mediaType"),
+            mediaUrl=posts[i].get("mediaUrl"),
+            similarity_score=round(float(similarity_scores[i]), 3)
+        )
         for i in top_indices if similarity_scores[i] > 0
     ]
 
-    # Handle no matches
-    if not results:
-        return {"message": f"No post found matching '{query}'"}
+    return results
 
-    return {"query": query, "matched_posts": results}
-
-# Example root
+# Root endpoint
 @app.get("/")
 def home():
-    return {"message": "Post Title Search API is running 🚀"}
+    return {"message": "Post Search API is running 🚀"}
